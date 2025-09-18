@@ -30,26 +30,28 @@ function saveCache() {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-// Fetch transactions using Helius, filtered for Pump.fun
-async function fetchTransactions(wallet) {
-  const url = `${HELIUS_BASE}/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=50&source=${PUMP_FUN_PROGRAM}`;
-  heliusRequestCount++;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Helius API error ${res.status}`);
-  return res.json();
-}
-
-// Batch fetch for multiple wallets
-async function fetchBatchTransactions(wallets) {
-  const body = wallets.map(w => ({ address: w, limit: 50, source: PUMP_FUN_PROGRAM }));
-  const res = await fetch(`${HELIUS_BASE}/batch/transactions?api-key=${HELIUS_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  heliusRequestCount++;
-  if (!res.ok) throw new Error(`Helius API error ${res.status}`);
-  return res.json();
+// Fetch transactions with retry and header-based auth
+async function fetchTransactions(wallet, retries = 3) {
+  const url = `${HELIUS_BASE.replace(/\?.*$/, '')}/v0/addresses/${wallet}/transactions?limit=50&source=${PUMP_FUN_PROGRAM}`;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    heliusRequestCount++;
+    try {
+      const res = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${HELIUS_API_KEY}` },
+      });
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error(`[fetch] Helius API error ${res.status} for ${wallet}: ${errorText}`);
+        if (res.status === 429) await new Promise(r => setTimeout(r, 1000 * (2 ** attempt))); // Exponential backoff for rate limits
+        else throw new Error(`Helius API error ${res.status}`);
+      }
+      return res.json();
+    } catch (e) {
+      if (attempt === retries - 1) throw e;
+      console.warn(`[fetch] Retry ${attempt + 1}/${retries} for ${wallet} due to: ${e.message}`);
+      await new Promise(r => setTimeout(r, 1000 * (2 ** attempt))); // Backoff
+    }
+  }
 }
 
 // Check if wallet created a Pump.fun token
@@ -79,7 +81,8 @@ async function getTokenPrice(tokenMint) {
     const res = await fetch(`https://api.birdeye.so/v1/token/price?address=${tokenMint}&api-key=${BIRDEYE_API_KEY}`);
     const data = await res.json();
     return data?.data?.price || 0.001; // Fallback for sim
-  } catch {
+  } catch (e) {
+    console.error(`[birdeye] Error fetching price for ${tokenMint}: ${e.message}`);
     return 0.001;
   }
 }
@@ -87,7 +90,9 @@ async function getTokenPrice(tokenMint) {
 // Estimate Solana priority fees
 async function estimateFees() {
   try {
-    const res = await fetch(`${HELIUS_BASE}/priority-fee?api-key=${HELIUS_API_KEY}`);
+    const res = await fetch(`${HELIUS_BASE.replace(/\?.*$/, '')}/priority-fee`, {
+      headers: { 'Authorization': `Bearer ${HELIUS_API_KEY}` },
+    });
     const data = await res.json();
     return data?.priorityFeeLevels?.medium || 0.015; // Default 0.015 SOL
   } catch {
@@ -162,38 +167,33 @@ export async function main() {
   const wallets = lines.map(line => line.split('|')[0].trim());
   const results = [];
 
-  // Batch fetch for efficiency
-  try {
-    const batchTxs = await fetchBatchTransactions(wallets);
-    for (const line of lines) {
-      const [wallet, nameRaw] = line.split('|').map(s => s.trim());
-      const name = nameRaw || 'unnamed';
-      console.log(`[analytics] Processing wallet: ${wallet} (${name})`);
+  // Individual fetches with fallback logic
+  for (const line of lines) {
+    const [wallet, nameRaw] = line.split('|').map(s => s.trim());
+    const name = nameRaw || 'unnamed';
+    console.log(`[analytics] Processing wallet: ${wallet} (${name})`);
 
-      try {
-        let txs;
-        if (cache[wallet]?.timestamp > Date.now() - 24 * 60 * 60 * 1000) {
-          console.log(`[analytics] Using cached data for ${wallet}`);
-          txs = cache[wallet].data;
-        } else {
-          txs = batchTxs[wallet] || await fetchTransactions(wallet);
-          cache[wallet] = { data: txs, timestamp: Date.now() };
-          saveCache();
-        }
-
-        const stats = await analyzeTrades(wallet, txs);
-        stats.name = name;
-        if (stats.isCreator) {
-          const tokenMint = txs.find(tx => tx.type === 'CREATE')?.accounts?.[1];
-          if (tokenMint) stats.isRugSafe = await checkRugRisk(tokenMint);
-        }
-        results.push(stats);
-      } catch (e) {
-        console.error(`[analytics] Error processing wallet ${wallet}:`, e.message);
+    try {
+      let txs;
+      if (cache[wallet]?.timestamp > Date.now() - 24 * 60 * 60 * 1000) {
+        console.log(`[analytics] Using cached data for ${wallet}`);
+        txs = cache[wallet].data;
+      } else {
+        txs = await fetchTransactions(wallet);
+        cache[wallet] = { data: txs, timestamp: Date.now() };
+        saveCache();
       }
+
+      const stats = await analyzeTrades(wallet, txs);
+      stats.name = name;
+      if (stats.isCreator) {
+        const tokenMint = txs.find(tx => tx.type === 'CREATE')?.accounts?.[1];
+        if (tokenMint) stats.isRugSafe = await checkRugRisk(tokenMint);
+      }
+      results.push(stats);
+    } catch (e) {
+      console.error(`[analytics] Error processing wallet ${wallet}:`, e.message);
     }
-  } catch (e) {
-    console.error('[analytics] Batch fetch error:', e.message);
   }
 
   // Save results
@@ -205,4 +205,3 @@ export async function main() {
 if (process.argv[1].includes('analytics.js')) {
   main();
 }
-
