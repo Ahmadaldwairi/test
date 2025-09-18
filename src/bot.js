@@ -1,12 +1,54 @@
 // src/bot.js
 import { Connection, Keypair } from '@solana/web3.js';
 import WebSocket from 'ws';
+import fetch from 'node-fetch';
 import { cfg } from './config.js';
 import { createWalletLoader } from './walletLoader.js';
 import { SessionLog } from './logger.js';
 import { exitPriceForTargetUsd } from './math.js';
 import { SimulatedAdapter } from './executionAdapters/simulated.js';
 import { getSolUsd } from './priceFeed.js';
+
+const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dk3FywbjC4tSpPxa1G2EvDRo1ZHt91';
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
+
+// Stubbed Jito adapter (implement buildPumpFunBuyTx/buildPumpFunSellTx for live mode)
+class JitoAdapter {
+  constructor({ jitoEndpoint, feeBps, maxSlippageBps }) {
+    this.jitoEndpoint = jitoEndpoint;
+    this.feeBps = feeBps;
+    this.maxSlippageBps = maxSlippageBps;
+  }
+
+  async buy({ solAmount, markUsd }) {
+    const tx = await buildPumpFunBuyTx(solAmount, markUsd); // Stub: implement Pump.fun swap
+    const bundle = new Bundle([tx], this.signer);
+    const res = await fetch(`${this.jitoEndpoint}/sendBundle`, {
+      method: 'POST',
+      body: JSON.stringify(bundle),
+    });
+    const result = await res.json();
+    return {
+      fillUsd: solAmount * (await getSolUsd()),
+      sizeTokens: solAmount / markUsd,
+      costUsd: solAmount * (await getSolUsd()) * (1 + this.feeBps / 10000),
+    };
+  }
+
+  async sell({ sizeTokens, targetExitUsd }) {
+    const tx = await buildPumpFunSellTx(sizeTokens, targetExitUsd); // Stub: implement swap
+    const bundle = new Bundle([tx], this.signer);
+    const res = await fetch(`${this.jitoEndpoint}/sendBundle`, {
+      method: 'POST',
+      body: JSON.stringify(bundle),
+    });
+    const result = await res.json();
+    return {
+      fillUsd: targetExitUsd,
+      proceedsUsd: targetExitUsd * sizeTokens * (1 - this.feeBps / 10000),
+    };
+  }
+}
 
 export class Bot {
   constructor({ mode, rpcUrl, wsUrl, execution = 'simulated' }) {
@@ -18,14 +60,13 @@ export class Bot {
     this.inFlight = 0;
     this.queue = [];
     this.seen = new Set(); // dedupe tx signatures
-    this.seenMax = 5000; 
+    this.seenMax = 5000;
 
     // tracked wallets: Map<addr, { name, rules }>
     this.tracked = new Map();
     this.stopWalletWatcher = createWalletLoader(cfg.walletsFile, cfg.reloadMs, (map) => {
       this.tracked = map;
       console.log(`[wallets] now tracking ${this.tracked.size} address(es)`);
-      // if WS is up, (re)subscribe for any new wallets
       if (this.ws && this.ws.readyState === this.ws.OPEN) {
         this.subscribeAll();
       }
@@ -34,11 +75,22 @@ export class Bot {
     // signer (not used in simulated mode)
     this.signer = this.loadSigner(cfg.secretKey);
 
-    // execution adapter (paper-trade now; later swap to live)
-    this.exec = new SimulatedAdapter({
+    // execution adapter
+    this.exec = execution === 'jito' ? new JitoAdapter({
+      jitoEndpoint: process.env.JITO_ENDPOINT,
+      feeBps: cfg.feeBps,
+      maxSlippageBps: cfg.maxSlippageBps,
+    }) : new SimulatedAdapter({
       feeBps: cfg.feeBps,
       maxSlippageBps: cfg.maxSlippageBps,
     });
+
+    // Latency test
+    this.latencyTest = setInterval(async () => {
+      const start = Date.now();
+      await this.conn.getSlot();
+      console.log(`[latency] RPC ping: ${Date.now() - start}ms`);
+    }, 10000);
   }
 
   loadSigner(secret) {
@@ -73,6 +125,26 @@ export class Bot {
     process.on('SIGINT', () => this.shutdown());
   }
 
+  async checkRugRisk(tokenMint) {
+    try {
+      const res = await fetch(`https://api.solscan.io/token/holders?token=${tokenMint}`);
+      const data = await res.json();
+      return data.result?.[0]?.amount / data.totalSupply < 0.2; // Safe if top holder <20%
+    } catch {
+      return false; // Assume risky if API fails
+    }
+  }
+
+  async getTokenPrice(tokenMint) {
+    try {
+      const res = await fetch(`https://api.birdeye.so/v1/token/price?address=${tokenMint}&api-key=${BIRDEYE_API_KEY}`);
+      const data = await res.json();
+      return data?.data?.price || 0.001; // Fallback for sim
+    } catch {
+      return 0.001;
+    }
+  }
+
   startWebSocket() {
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
@@ -82,25 +154,20 @@ export class Bot {
       this.subscribeAll();
     });
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       const tDetect = Date.now();
       try {
         const msg = JSON.parse(data.toString());
         if (msg.method === 'logsNotification') {
-          const { signature, err } = msg.params.result;
-          if (err) return; // ignore failed tx logs
+          const { signature, logs } = msg.params.result;
+          if (!logs?.includes(PUMP_FUN_PROGRAM)) return; // Skip non-Pump.fun txs
           if (this.seen.has(signature)) return;
           this.seen.add(signature);
           if (this.seen.size > this.seenMax) {
-  // quick prune: recreate with last N (no need to be perfect)
-  this.seen = new Set(Array.from(this.seen).slice(-this.seenMax));
-}
-
-
-          // We used wallet address as subscription ID when we subscribed
+            this.seen = new Set(Array.from(this.seen).slice(-this.seenMax));
+          }
           const walletAddr = String(msg.params.subscription || '');
           if (!this.tracked.has(walletAddr)) return;
-
           this.queue.push({
             type: 'signal',
             wallet: walletAddr,
@@ -124,11 +191,10 @@ export class Bot {
   }
 
   subscribeAll() {
-    // Subscribe to logs mentioning each wallet (standard Solana WS)
     for (const [addr] of this.tracked.entries()) {
       const sub = {
         jsonrpc: '2.0',
-        id: addr, // keep ID = wallet so we can map notifications
+        id: addr,
         method: 'logsSubscribe',
         params: [
           { mentions: [addr] },
@@ -158,7 +224,7 @@ export class Bot {
       } finally {
         this.inFlight--;
       }
-    }, 50); // tight loop for low latency
+    }, 50);
   }
 
   async handleSignal(job) {
@@ -166,27 +232,53 @@ export class Bot {
     const walletInfo = this.tracked.get(job.wallet);
     const walletName = walletInfo?.name || job.wallet;
     const rules = walletInfo?.rules || {};
+    const isCreator = rules.isCreator || false;
 
-    // --- live SOL/USD ---
-    const solUsd = await getSolUsd(); // cached a few seconds
-    const myBuyUsd = cfg.buySol * solUsd;
+    // Check tx for Pump.fun CREATE
+    const tx = await this.conn.getTransaction(job.sig, { commitment: 'confirmed' });
+    const isCreateTx = tx?.meta?.logMessages?.some(log => log.includes(PUMP_FUN_PROGRAM) && log.includes('create'));
 
-    // rules with fallbacks
-    const tpMultiple = rules.tp_multiple ?? 1.5;
-    const holdSeconds = rules.avg_hold_seconds ?? 20;
-    const minBuyUsd = rules.min_buy_usd ?? 50;
-
-    if (myBuyUsd < minBuyUsd) {
-      console.log(`[skip] ${walletName}: not enough size (have ~$${myBuyUsd.toFixed(2)}, need ≥ $${minBuyUsd})`);
+    // Creator launch: buy and hold manually
+    if (isCreator && isCreateTx) {
+      const tokenMint = tx?.meta?.innerInstructions?.[0]?.accounts?.[0];
+      if (tokenMint && !await this.checkRugRisk(tokenMint)) {
+        console.log(`[skip] ${walletName}: High rug risk (top holder >20%)`);
+        return;
+      }
+      const mark = await this.getTokenPrice(tokenMint);
+      const buy = await this.exec.buy({ solAmount: cfg.buySol, markUsd: mark });
+      this.log.newTrade({
+        side: 'creator',
+        base: 'TOKEN',
+        quote: 'USD',
+        costUsd: buy.costUsd,
+        proceedsUsd: 0, // Manual exit
+        realizedUsd: 0, // TBD
+      });
+      console.log(`[creator #${this.log.count}] ${walletName} | Bought $${buy.costUsd.toFixed(2)} | Holding for manual exit`);
       return;
     }
 
-    // ----- BUY (simulated adapter uses markUsd; keep placeholder mark) -----
-    const mark = 0.001; // fake token mark price (paper trading)
-    const buy = await this.exec.buy({ solAmount: cfg.buySol, markUsd: mark });
+    // Non-creator trade
+    const solUsd = await getSolUsd();
+    const estBuySizeUsd = rules.est_buy_size_usd || 10;
+    const buySol = Math.min(estBuySizeUsd / solUsd, cfg.buySol);
+    const minBuyUsd = rules.min_buy_usd || 50;
 
-    // Exit target by multiple (translate to USD total proceeds)
-    // We’ll ask math helper for a target *price*, using target total USD = entryUSD * tpMultiple
+    if (buySol * solUsd < minBuyUsd) {
+      console.log(`[skip] ${walletName}: not enough size (have ~$${(buySol * solUsd).toFixed(2)}, need ≥ $${minBuyUsd})`);
+      return;
+    }
+
+    const tokenMint = tx?.meta?.innerInstructions?.[0]?.accounts?.[0];
+    if (tokenMint && !await this.checkRugRisk(tokenMint)) {
+      console.log(`[skip] ${walletName}: High rug risk (top holder >20%)`);
+      return;
+    }
+
+    const mark = await this.getTokenPrice(tokenMint);
+    const buy = await this.exec.buy({ solAmount: buySol, markUsd: mark });
+    const tpMultiple = rules.tp_multiple || 1.5;
     const targetTotalUsd = buy.fillUsd * tpMultiple * buy.sizeTokens;
     const exitUsd = exitPriceForTargetUsd({
       entryUsd: buy.fillUsd,
@@ -196,20 +288,18 @@ export class Bot {
       targetUsd: targetTotalUsd,
     });
 
-    // Optional: “time hold” in sim mode to mimic behavior pattern
+    const holdSeconds = rules.avg_hold_seconds || 20;
     if (holdSeconds > 0) {
-      await new Promise((r) => setTimeout(r, holdSeconds * 1000));
+      await new Promise(r => setTimeout(r, holdSeconds * 1000));
     }
 
     const sell = await this.exec.sell({ sizeTokens: buy.sizeTokens, targetExitUsd: exitUsd });
     const realizedUsd = sell.proceedsUsd - buy.costUsd;
 
-    // latency metrics
     const tDone = Date.now();
     const latencyDetectToHandle = tStart - (job.tDetect || tStart);
     const latencyTotal = tDone - (job.tDetect || tStart);
 
-    // log + session stats
     const t = this.log.newTrade({
       side: 'scalp',
       base: 'TOKEN',
@@ -220,14 +310,13 @@ export class Bot {
     });
 
     console.log(
-      `[trade #${t.id}] ${walletName} | SOL ~$${solUsd.toFixed(2)} | buy $${buy.fillUsd.toFixed(6)} → sell ~$${(sell.fillUsd || exitUsd).toFixed(6)} | P/L $${realizedUsd.toFixed(
-        2
-      )} | detect→start ${latencyDetectToHandle}ms | total ${latencyTotal}ms`
+      `[trade #${t.id}] ${walletName} | SOL ~$${solUsd.toFixed(2)} | buy $${buy.fillUsd.toFixed(6)} → sell ~$${sell.fillUsd.toFixed(6)} | P/L $${realizedUsd.toFixed(2)} | detect→start ${latencyDetectToHandle}ms | total ${latencyTotal}ms`
     );
   }
 
   async shutdown() {
     if (this.worker) clearInterval(this.worker);
+    if (this.latencyTest) clearInterval(this.latencyTest);
     if (this.stopWalletWatcher) this.stopWalletWatcher();
     if (this.ws) {
       try { this.ws.close(); } catch {}
