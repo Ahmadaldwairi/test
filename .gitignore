@@ -1,0 +1,14 @@
+# Ignore environment variables
+.env
+
+# Ignore cache & local analytics output
+analytics_cache.json
+analytics_output.json
+wallets.json
+pubkey.txt
+tracked_wallets.txt
+trades.csv
+src.zip
+
+# Node.js dependencies
+node_modules/
