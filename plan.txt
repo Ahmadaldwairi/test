@@ -1,0 +1,67 @@
+Bot Development Plan - September 19, 2025
+========================================
+
+This document outlines the structure, testing plan, and next steps for building your cutting-edge trading bot system. Created at 10:18 PM EDT, Friday, September 19, 2025. Follow the steps one by one starting tomorrow.
+
+---
+
+### Breakdown of Your Points and Suggestions
+
+#### Point 1: Feeling Lost – List of Bots and Testing Plan
+You’re building a data-heavy bot system. Tackle one bot at a time, test individually, and stress-test before going live. Here are the bots/modules:
+
+- **1. Analytics Bot (`analytics.js`)**:
+  - **Purpose**: Analyzes wallet performance (success rate, profit, creation history) and outputs `analytics_output.json`.
+  - **Data Needs**: Transaction history from Helius, token prices from Birdeye, rug risk from Solscan.
+  - **Testing**: Run with 10-20 wallets, verify `hasCreated` and `dumpTrigger` flags, check for 404 errors (fix with paid Helius if persistent).
+
+- **2. Execution Bot (`bot.js`)**:
+  - **Purpose**: Executes trades based on signals, handles balance checks, unique coins, and auto-sells for flagged dumps.
+  - **Data Needs**: Reads `analytics_output.json`, `sol_price.json`, WebSocket signals from Helius.
+  - **Testing**: Simulate 50-100 trades/day with `mode=dev`, monitor latency (<300ms), and confirm $5-$10 profits.
+
+- **3. Price Feed Bot (`priceFeed.js`)**:
+  - **Purpose**: Updates `sol_price.json` with real-time SOL/USD via Jupiter’s free API.
+  - **Data Needs**: Jupiter API.
+  - **Testing**: Run in background, verify `sol_price.json` updates every 5 minutes, test fallback (25 USD).
+
+- **4. Wallet Discovery Bot (`walletTracker.js`)**:
+  - **Purpose**: Weekly scan of Solana blockchain for meme coin wallets (Pump.fun, Punk’d Fun, etc.), flagging high-profit (70%+, 80%+, 90%) and creator wallets with coins >50k market cap. Also flags most active hours for successful wallets, converted to your time zone for manual monitoring.
+  - **Data Needs**: Transaction logs (Helius/Solana RPC), market cap (Birdeye).
+  - **Testing**: Pilot with 50 wallets, validate profit flags, activity times, and creator metrics.
+
+- **5. Telegram Notification Bot (`telegramBot.js`)**:
+  - **Purpose**: Notifies you via Telegram only for creator wallet buys (manual exit triggers).
+  - **Data Needs**: Integrates with `bot.js` signals.
+  - **Testing**: Set up with a test channel, verify notifications for creator buys only.
+
+**Testing Plan**:
+- **Step-by-Step**: Test each bot independently (e.g., `priceFeed.js` first, then `analytics.js`, etc.) before integration.
+- **Stress Test**: Run each with max load (e.g., 100 wallets for `bot.js`, 500 for `walletTracker.js`).
+- **Go Live**: Switch to paid Helius/Birdeye tiers, integrate all bots, and monitor live trades.
+
+#### Point 2: Cost Management and Free vs. Paid APIs
+- **Current Setup**: Using Helius and Birdeye free tiers for testing, Jupiter free API for pricing.
+- **Solana Free RPC**: Usable for `analytics.js` (daily runs tolerate latency), but not ideal for `walletTracker.js` or `bot.js` due to slow response (200-500ms) and rate limits (200 req/sec). Paid Helius ($10-$50/month) recommended for real-time data.
+- **Recommendation**: Test with free tiers now, budget $30-$50/month for Helius/Birdeye paid tiers pre-launch. Keep Jupiter free.
+
+#### Point 3: Wallet Discovery Bot (`walletTracker.js`)
+- **Frequency**: Weekly (e.g., Sunday midnight).
+- **Platforms**: Pump.fun, Punk’d Fun, other meme coin programs (e.g., Raydium pools).
+- **Data to Pull**:
+  - Success Rate: >70%, >80%, >90%.
+  - Avg Profit/Trade: USD/SOL gain.
+  - Total Profit: Cumulative gains.
+  - Trade Size: Avg SOL/USD invested.
+  - Hold Time: Avg seconds held.
+  - Creator Metrics: Coins created, max market cap (>50k), success rate.
+  - Activity Times: Most active hours, converted to your time zone.
+  - New Wallets: Untracked high-performers.
+  - Suggested Additions: Volume traded, pump duration, dump speed.
+- **Implementation**: Scan Solana RPC logs, filter wallets, cross-check with Birdeye.
+- **Output**: `wallet_discovery.json`.
+
+#### Point 4: Telegram Notification Bot (`telegramBot.js`)
+- **Purpose**: Notify only for creator wallet buys.
+- **Implementation**: Use Telegram Bot API, integrate with `bot.js`.
+- **Code Snippet**:
